@@ -1,40 +1,13 @@
 import uuid
 import json
+import re
 import httpx
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from loguru import logger
 from utils.gemini_client import generate_json
 
-STUDY_PARSER_SYSTEM_PROMPT = """You are a clinical trial data parser. Your job is to convert raw
-ClinicalTrials.gov API study data into clean, structured trial formats.
-
-You will receive an array of raw study objects. Return a JSON array with one object per study.
-Each object must have these exact keys:
-{
-  "trial_id": "<NCT ID>",
-  "trial_name": "<brief title>",
-  "description": "<official title or brief description>",
-  "phase": "<Phase 1|Phase 2|Phase 3|Phase 4|Not Applicable>",
-  "status": "recruiting",
-  "included_conditions": ["<condition1>", ...],
-  "age_min": <integer, default 18>,
-  "age_max": <integer, default 75>,
-  "location": "<primary location or 'Multiple Locations'>",
-  "drug_name": "<intervention name or 'Investigational Drug'>",
-  "drug_class": "<drug class or 'Therapeutic'>",
-  "side_effects": ["<known side effect>", ...],
-  "enrollment_target": <integer>,
-  "duration_months": <integer estimate>,
-  "source": "ClinicalTrials.gov"
-}
-
-Rules:
-- Return one object per input study, in the same order.
-- Extract all available fields from the raw study data.
-- If a field is missing, use sensible defaults.
-- For age_min/age_max, parse strings like "18 Years" into integers.
-- For side_effects, if none listed, use ["Study specific"].
-- Return ONLY a valid JSON array."""
+# ClinicalTrials.gov API v2 base URL
+CTGOV_API_BASE = "https://clinicaltrials.gov/api/v2"
 
 FALLBACK_TRIALS_SYSTEM_PROMPT = """You are a clinical trial data specialist. When the ClinicalTrials.gov
 API is unavailable, generate realistic mock clinical trial data for testing purposes.
@@ -42,20 +15,29 @@ API is unavailable, generate realistic mock clinical trial data for testing purp
 You will receive a patient condition. Return a JSON array of 2-3 realistic trial objects:
 [
   {
-    "trial_id": "<MOCK-xxxxxx>",
+    "trial_id": "<NCTxxxxxxxx>",
     "trial_name": "<realistic trial name for the condition>",
     "description": "<realistic trial description>",
     "phase": "<Phase 2 or Phase 3>",
     "status": "recruiting",
     "included_conditions": ["<condition>"],
+    "excluded_conditions": [],
     "age_min": <integer>,
     "age_max": <integer>,
+    "gender": ["M", "F"],
     "location": "<realistic location>",
     "drug_name": "<realistic drug name>",
     "drug_class": "<drug class>",
     "side_effects": ["<side effect>", ...],
+    "excluded_medications": [],
+    "excluded_allergies": [],
     "enrollment_target": <integer>,
     "duration_months": <integer>,
+    "sponsor": "<sponsor name>",
+    "contact_email": null,
+    "bmi_min": null,
+    "bmi_max": null,
+    "required_lab_tests": {},
     "source": "Mock Data"
   }
 ]
@@ -63,83 +45,187 @@ You will receive a patient condition. Return a JSON array of 2-3 realistic trial
 Rules:
 - Make the trials medically realistic for the given condition.
 - Use varied phases, locations, and drug names.
-- Generate unique MOCK-xxxxxx IDs.
+- Generate unique NCT-style IDs.
 - Return ONLY a valid JSON array."""
 
 
 class WebScrapingAgent:
     """
     Agent responsible for discovering clinical trials from ClinicalTrials.gov
-    based on patient conditions. Uses Gemini LLM for study data parsing and
-    fallback trial generation.
+    based on patient conditions. Falls back to Gemini LLM mock generation
+    if the API is unreachable.
     """
 
     def __init__(self):
         self.logger = logger
         self.agent_id = "web_scraping_agent"
         self.role = "Clinical Trial Discovery Specialist"
-        self.base_url = "https://clinicaltrials.gov/api/v2/studies"
+        self.api_base = CTGOV_API_BASE
+        self.max_results = 10
+        self.timeout = 15  # seconds
+
+    # ── helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_age_limit(eligibility: dict, key: str) -> Optional[int]:
+        """Pull min/max age from the eligibility block and convert to int years."""
+        raw = eligibility.get(key)
+        if not raw:
+            return None
+        match = re.search(r"(\d+)", str(raw))
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _map_gender(sex: Optional[str]) -> List[str]:
+        if not sex or sex.upper() == "ALL":
+            return ["M", "F", "Other"]
+        if sex.upper() == "MALE":
+            return ["M"]
+        if sex.upper() == "FEMALE":
+            return ["F"]
+        return ["M", "F", "Other"]
+
+    @staticmethod
+    def _map_phase(phases: Optional[list]) -> str:
+        if not phases:
+            return "Not specified"
+        return ", ".join(p.replace("PHASE", "Phase ").strip() for p in phases)
+
+    @staticmethod
+    def _map_status(raw: Optional[str]) -> str:
+        mapping = {
+            "RECRUITING": "recruiting",
+            "ACTIVE_NOT_RECRUITING": "active",
+            "COMPLETED": "completed",
+            "NOT_YET_RECRUITING": "not yet recruiting",
+            "ENROLLING_BY_INVITATION": "enrolling by invitation",
+        }
+        return mapping.get((raw or "").upper(), (raw or "unknown").lower())
+
+    def _api_study_to_trial(self, study: dict) -> Dict[str, Any]:
+        """Convert a ClinicalTrials.gov v2 study object to the pipeline trial dict."""
+        proto = study.get("protocolSection", {})
+        ident = proto.get("identificationModule", {})
+        status_mod = proto.get("statusModule", {})
+        design = proto.get("designModule", {})
+        eligibility = proto.get("eligibilityModule", {})
+        desc_mod = proto.get("descriptionModule", {})
+        contacts_mod = proto.get("contactsLocationsModule", {})
+        sponsor_mod = proto.get("sponsorCollaboratorsModule", {})
+        arms_mod = proto.get("armsInterventionsModule", {})
+        conditions_mod = proto.get("conditionsModule", {})
+
+        # -- locations --
+        locations = contacts_mod.get("locations", [])
+        location_str = (
+            f"{locations[0].get('city', '')}, {locations[0].get('state', '')}"
+            if locations
+            else "Not specified"
+        )
+
+        # -- contact email --
+        central_contacts = contacts_mod.get("centralContacts", [])
+        email = central_contacts[0].get("email") if central_contacts else None
+
+        # -- drug / intervention info --
+        interventions = arms_mod.get("interventions", [])
+        drug_name = interventions[0].get("name", "Investigational Agent") if interventions else "Not specified"
+        drug_class = interventions[0].get("type", "Other") if interventions else "Not specified"
+
+        # -- sponsor --
+        lead = sponsor_mod.get("leadSponsor", {})
+        sponsor = lead.get("name", "Not specified")
+
+        # -- eligibility criteria text (for downstream trial_parser_agent) --
+        criteria_text = eligibility.get("eligibilityCriteria", "")
+
+        # -- enrollment --
+        enrollment_info = design.get("enrollmentInfo", {})
+        enrollment_target = enrollment_info.get("count")
+
+        return {
+            "trial_id": ident.get("nctId", f"NCT-{uuid.uuid4().hex[:8]}"),
+            "trial_name": ident.get("officialTitle") or ident.get("briefTitle", "Unnamed Trial"),
+            "description": desc_mod.get("briefSummary", ""),
+            "phase": self._map_phase(design.get("phases")),
+            "status": self._map_status(status_mod.get("overallStatus")),
+            "included_conditions": conditions_mod.get("conditions", []),
+            "excluded_conditions": [],
+            "age_min": self._extract_age_limit(eligibility, "minimumAge"),
+            "age_max": self._extract_age_limit(eligibility, "maximumAge"),
+            "gender": self._map_gender(eligibility.get("sex")),
+            "location": location_str,
+            "drug_name": drug_name,
+            "drug_class": drug_class,
+            "side_effects": [],
+            "excluded_medications": [],
+            "excluded_allergies": [],
+            "bmi_min": None,
+            "bmi_max": None,
+            "required_lab_tests": {},
+            "enrollment_target": int(enrollment_target) if enrollment_target else None,
+            "duration_months": None,
+            "sponsor": sponsor,
+            "contact_email": email,
+            "eligibility_criteria_text": criteria_text,
+            "source": "ClinicalTrials.gov",
+        }
+
+    # ── main entry point ─────────────────────────────────────────────────
 
     async def scrape_clinical_trials(self, patient_data: Dict[str, Any]) -> Dict[str, Any]:
-        self.logger.info("[WebScrapingAgent] Searching clinical trials")
+        self.logger.info("[WebScrapingAgent] Searching clinical trials from ClinicalTrials.gov")
 
-        try:
-            conditions = patient_data.get("conditions", [])
-            if not conditions:
-                return {
-                    "trials": [],
-                    "total_found": 0,
-                    "message": "No conditions provided"
-                }
-
-            primary_condition = conditions[0].lower()
-
-            params = {
-                "query.cond": primary_condition,
-                "filter.overallStatus": "RECRUITING",
-                "pageSize": 10,
+        conditions = patient_data.get("conditions", [])
+        if not conditions:
+            return {
+                "trials": [],
+                "total_found": 0,
+                "message": "No conditions provided",
             }
 
-            self.logger.info(
-                f"[WebScrapingAgent] Querying ClinicalTrials.gov for: {primary_condition}"
-            )
+        primary_condition = conditions[0]
+        self.logger.info(
+            f"[WebScrapingAgent] Querying ClinicalTrials.gov for: {primary_condition}"
+        )
 
-            async with httpx.AsyncClient(timeout=15) as client:
-                response = await client.get(self.base_url, params=params)
-                response.raise_for_status()
-                data = response.json()
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.get(
+                    f"{self.api_base}/studies",
+                    params={
+                        "query.cond": primary_condition,
+                        "filter.overallStatus": "RECRUITING",
+                        "pageSize": self.max_results,
+                        "format": "json",
+                    },
+                )
+                resp.raise_for_status()
 
-            trials = []
+            data = resp.json()
             studies = data.get("studies", [])
-            if studies:
-                trials = self._process_all_studies(studies)
 
-            self.logger.info(f"[WebScrapingAgent] Found {len(trials)} trials")
+            trials = [self._api_study_to_trial(s) for s in studies]
+            self.logger.info(f"[WebScrapingAgent] Found {len(trials)} trials from API")
+
+            if not trials:
+                self.logger.info("[WebScrapingAgent] API returned 0 results, using fallback")
+                return self._create_fallback_trials(patient_data)
 
             return {
                 "trials": trials,
                 "total_found": len(trials),
                 "search_condition": primary_condition,
-                "source": "ClinicalTrials.gov API",
+                "source": "ClinicalTrials.gov",
             }
 
         except Exception as e:
             self.logger.warning(
-                f"[WebScrapingAgent] API failed, using fallback trials: {str(e)}"
+                f"[WebScrapingAgent] API request failed, using fallback trials: {str(e)}"
             )
             return self._create_fallback_trials(patient_data)
 
-    def _process_all_studies(self, studies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Use a single Gemini LLM call to parse all studies at once."""
-        try:
-            prompt = f"Parse these {len(studies)} ClinicalTrials.gov studies into structured format:\n\n{json.dumps(studies, indent=2, default=str)}"
-            result = generate_json(STUDY_PARSER_SYSTEM_PROMPT, prompt)
-            if isinstance(result, list):
-                return [t for t in result if t]
-            return [result] if result else []
-        except Exception as e:
-            self.logger.warning(f"[WebScrapingAgent] Failed to process studies: {str(e)}")
-            return []
+    # ── fallback ─────────────────────────────────────────────────────────
 
     def _create_fallback_trials(self, patient_data: Dict[str, Any]) -> Dict[str, Any]:
         """Use Gemini LLM to generate realistic fallback trials."""
@@ -161,14 +247,23 @@ class WebScrapingAgent:
                     "phase": "Phase 3",
                     "status": "recruiting",
                     "included_conditions": [primary_condition],
+                    "excluded_conditions": [],
                     "age_min": 18,
                     "age_max": 75,
+                    "gender": ["M", "F"],
                     "location": "Multiple locations",
                     "drug_name": "Investigational Drug",
                     "drug_class": "Therapeutic",
                     "side_effects": ["Nausea", "Fatigue"],
+                    "excluded_medications": [],
+                    "excluded_allergies": [],
+                    "bmi_min": None,
+                    "bmi_max": None,
+                    "required_lab_tests": {},
                     "enrollment_target": 200,
                     "duration_months": 24,
+                    "sponsor": "Research Institute",
+                    "contact_email": None,
                     "source": "Mock Data",
                 }
             ]
@@ -184,8 +279,8 @@ class WebScrapingAgent:
         return {
             "agent_id": self.agent_id,
             "role": self.role,
-            "data_source": "ClinicalTrials.gov",
-            "method": "Gemini LLM trial parsing",
+            "data_source": "ClinicalTrials.gov API",
+            "method": "REST API (v2) + LLM fallback",
             "async_supported": True,
         }
 
